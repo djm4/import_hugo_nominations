@@ -4,6 +4,7 @@ import csv
 import psycopg2 as dbm
 from psycopg2.extras import Json
 import configparser
+from pprint import pprint
 
 
 class HugoTranslator:
@@ -78,87 +79,106 @@ class HugoTranslator:
 
         self.dbconn = dbconn
 
-    def connect_discon_db(self):
-        dbconn = None
-        params = self.config['discon3_db']
-        try:
-            dbconn = dbm.connect(
-                database=params['database'],
-                user=params['user'],
-                password=params['password'],
-                host=params['host'],
-                port=params['port'])
-        except dbm.OperationalError as err:
-            print(f"Unable to connect to database {err}")
-            exit(0)
-
-        self.discon_dbconn = dbconn
-
     def import_file(self):
-        filename = self.config['file']['nominations_filename']
+        filename = self.config['file']['votes_filename']
         with open(filename, 'r') as fh:
             reader = csv.reader(fh)
             next(reader)   # Skip header row
-            nominations_list = {}
+            categorised_finalists_list = {}
+            votes_list = {}
             for row in reader:
                 current_ip, last_ip, current_ts, last_ts, contact_updated_ts, user_created_ts, \
-                    contact_created_ts, nominations_created_ts, membership_id, email, sign_in_count, \
-                    preferred_first_name, preferred_last_name, first_name, last_name, \
-                    category, nominations_field_1, nominations_field_2, nominations_field_3, \
+                    contact_created_ts, ranks_created_ts, membership_id, email, \
+                    preferred_first_name, preferred_last_name, title, first_name, last_name, \
+                    category, finalist, position, \
                     *blank_fields = row
                 normalised_category = self.category_map[category]
-                category_fields = self.fields_map[category]
                 if current_ts == '':
                     current_ts = '1970-01-01 00:00:00'
-                nominations_key = (current_ts, current_ip, membership_id, first_name, last_name, normalised_category)
-                if nominations_key in nominations_list:
-                    nominations_list[nominations_key].append({
-                        category_fields[0]: nominations_field_1,
-                        category_fields[1]: nominations_field_2,
-                        category_fields[2]: nominations_field_3,
-                    })
+                votes_key = (membership_id, first_name, last_name, normalised_category)
+                categorised_finalist = (normalised_category, finalist)
+                with self.dbconn.cursor() as cursor:
+                    if finalist == 'No Award':
+                        finalist_id = -1
+                    else:
+                        query = """
+                        SELECT id FROM hugo.finalists
+                            WHERE competition='Hugos' AND category=%s AND title=%s
+                        """
+                        try:
+                            cursor.execute(query, categorised_finalist)
+                        except Exception as err:
+                            print(f"Unable to run query {err}")
+                            exit(0)
+                        row = cursor.fetchone()
+                        if row is None:
+                            query = """
+                            INSERT INTO hugo.finalists
+                                (competition, category, sortindex, title, subtitle)
+                                VALUES ('Hugos', %s, 1, %s, '') returning id
+                            """
+                            try:
+                                cursor.execute(query, categorised_finalist)
+                                row = cursor.fetchone()
+                                categorised_finalists_list[categorised_finalist] = row[0]
+                                print(f'Adding new entry, ID {categorised_finalists_list[categorised_finalist]}')
+                            except Exception as err:
+                                print(f"Unable to run query {err}")
+                                exit(0)
+                        else:
+                            categorised_finalists_list[categorised_finalist] = row[0]
+                            print("Entry already exists: skipping...", categorised_finalists_list[categorised_finalist])
+
+                        finalist_id = categorised_finalists_list[(normalised_category, finalist)]
+                if votes_key in votes_list:
+
+                    votes_list[votes_key][int(position)] = finalist_id
+
                 else:
-                    nominations_list[nominations_key] = [{
-                        category_fields[0]: nominations_field_1,
-                        category_fields[1]: nominations_field_2,
-                        category_fields[2]: nominations_field_3,
-                    }]
+                    votes_list[votes_key] = {
+                        int(position): finalist_id
+                    }
+
+            self.dbconn.commit()
+            cursor.close()
+            pprint(votes_list)
+            votes_rankings = {}
+
+            for (vote_key, finalists) in votes_list.items():
+                votes_rankings[vote_key] = []
+                for rank in sorted(finalists.keys()):
+                    votes_rankings[vote_key].append(finalists[rank])
 
             with self.dbconn.cursor() as cursor:
-                for nominations_key in nominations_list:
-                    print(nominations_key, nominations_list[nominations_key])
-                    current_ts, current_ip, membership_id, first_name, last_name, normalised_category = nominations_key
+                for (vote_key, rankings) in votes_rankings.items():
+                    membership_id, first_name, last_name, normalised_category = vote_key
                     row = None
                     query = """
-                    SELECT id FROM hugo.nominations
-                        WHERE time=%s AND client_ip=%s AND client_ua='User Agent' AND person_id=%s
-                            AND signature=%s AND competition='Hugos' AND category=%s
+                    SELECT id FROM hugo.votes
+                        WHERE client_ip='127.0.0.1' AND client_ua='User Agent' AND competition='Hugos'
+                            AND person_id=%s AND signature=%s AND category=%s
                     """
                     try:
                         cursor.execute(query, (
-                            current_ts, current_ip, membership_id, f"{first_name} {last_name}",
-                            normalised_category
+                            membership_id, f"{first_name} {last_name}", normalised_category
                         ))
                     except Exception as err:
                         print(f"Unable to run query {err}")
                         exit(0)
-                    if cursor.fetchone() is not None:
-                        print("Entry already exists: skipping...")
-                        continue
-                    query = """
-                    INSERT INTO hugo.nominations
-                        (time, client_ip, client_ua, person_id, signature, competition, category, nominations)
-                        VALUES (%s, %s, 'User Agent', %s, %s, 'Hugos', %s, %s::jsonb[])
-                    """
-                    nominations = [Json(x) for x in nominations_list[nominations_key]]
-                    try:
-                        cursor.execute(query, (
-                            current_ts, current_ip, membership_id, f"{first_name} {last_name}",
-                            normalised_category, nominations
-                        ))
-                    except Exception as err:
-                        print(f"Unable to run query {err}")
-                        exit(0)
+                    if cursor.fetchone() is None:
+                        query = """
+                        INSERT INTO hugo.votes
+                            (client_ip, client_ua, person_id, signature, competition, category, votes)
+                            VALUES ('127.0.0.1','User Agent', %s, %s, 'Hugos', %s, %s::integer[])
+                        """
+                        json_rankings = [Json(x) for x in rankings]
+                        try:
+                            cursor.execute(query, (
+                                membership_id, f"{first_name} {last_name}", normalised_category, json_rankings
+                            ))
+                        except Exception as err:
+                            print(f"Unable to run query {err}")
+                            exit(0)
             self.dbconn.commit()
             cursor.close()
 

@@ -43,3 +43,8 @@ venv
 
 # IDE
 .idea
+
+results
+ranks-*.csv
+nominations-*.csv
+config.ini
